@@ -1,0 +1,152 @@
+# =============================================================================
+# .gitignore — rewritten 2026-09-06 for the reorganised layout.
+#
+# LESSON ENCODED HERE: the previous file used unanchored directory rules like
+# `unet_run_fixednorm/`, which match at ANY depth. After the reorganisation
+# those silently swallowed the tracked metrics.json / training_log.csv files
+# that had moved to runs/unet/unet_run_fixednorm/. Rules that mean "at the
+# repo root" are now anchored with a leading slash. Also note git cannot
+# re-include a file whose parent directory is excluded, so directories that
+# contain anything worth tracking are never excluded wholesale — the heavy
+# file TYPES are excluded instead.
+# =============================================================================
+
+# --- datasets and derived arrays: never in git -------------------------------
+data/
+
+# --- model weights and framework checkpoints, at any depth -------------------
+*.pkl
+*.pt
+*.pth
+*.h5
+*.ckpt
+model.ckpt.*
+events.out.tfevents.*
+**/checkpoint
+
+# --- heavy run artefacts (the small metrics/logs beside them stay tracked) ---
+runs/**/checkpoints/
+runs/**/predictions/
+runs/lofar/*/ckpt/
+runs/lofar/*/best/
+runs/prediction/
+/prediction/
+pred/
+
+# --- large generated image sets ----------------------------------------------
+docs/preview/
+results/*.npy
+
+# --- analysis working data ---------------------------------------------------
+analysis/hera_transfer_test/HERA_npy/
+
+# --- HERA run outputs (about 70 MB of test predictions per run) ----------------
+runs/hera/**/*.npy
+runs/hera/.run_hera.lock
+
+# --- python / editor / os ----------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- copyrighted PDFs --------------------------------------------------------
+RFI_Using_UNET.pdf
+
+# --- misc --------------------------------------------------------------------
+video_transcript_*.txt
+
+# --- LOFAR test predictions saved for analysis (about 100 MB per run) ------
+runs/lofar/**/test_pred*.npy
+
+# --- kept on this laptop only, not published (2026-11-21) ---------------------
+# The public repository holds only the code and results behind the main results.
+/*.md
+!/README.md
+/RFI-project-context.md
+/*.pdf
+/*.pptx
+/*.zip
+/docs/
+/notes/
+/notebooks/
+/results/
+/presentations/
+/report/*
+!/report/Images/
+/report/Images/*
+!/report/Images/Figures/
+/report/Images/Figures/*
+!/report/Images/Figures/make_data_figures.py
+/report_first_person/
+/presentation/
+/analysis/ablation_faint_recall.py
+/analysis/audit_hybrid_result.py
+/analysis/diagnose_context_headroom.*
+/analysis/summarise_edge.py
+/analysis/dataset_v4_bandpass/
+/analysis/error_decomposition/
+/analysis/hera_transfer_test/
+/analysis/lofar_eda/
+/analysis/active_learning/*
+!/analysis/active_learning/summarise_al.py
+/analysis/last_vs_best/hybrid_last_vs_best.*
+/analysis/lofar_analysis/*
+!/analysis/lofar_analysis/prove_test_set_leakage.py
+!/analysis/lofar_analysis/convert_pickle_to_memmap.py
+!/analysis/lofar_analysis/deep_audit_stage4_labels.py
+!/analysis/lofar_analysis/sigma_clip_auc.*
+!/analysis/lofar_analysis/lofar_clean_train_idx.npy
+!/analysis/lofar_analysis/lofar_leak_train_idx.npy
+/experiments/README.md
+/experiments/classical_baselines.py
+/experiments/dataset_difficulty.py
+/experiments/run_ablation.py
+/experiments/normalisation_control/
+/experiments/recipe_switch/
+/scripts/backup_to_usb.sh
+/scripts/status.sh
+/scripts/run_fair_mesarcik.sh
+/scripts/run_lofar_baseline.sh
+/scripts/run_lofar_curves.sh
+/scripts/run_lofar_edge.sh
+/scripts/run_lofar_patches.sh
+/scripts/run_mesarcik_gap.sh
+/scripts/run_mesarcik_keras2.sh
+/scripts/run_recipe_switch.sh
+/src/unet_rfi_package/
+/src/unet_rfi_package\ copy/*
+!/src/unet_rfi_package\ copy/tf_unet/
+/src/hybrid_rfi_package/*.md
+/src/hybrid_rfi_package/evaluate_hybrid_test.py
+/src/hybrid_rfi_package/make_val_split.py
+/runs/logs/
+/runs/lofar/logs/
+/runs/lofar/converged_seed0/
+/runs/lofar/curves_*/
+/runs/lofar/edge_*/
+/runs/lofar/hybrid_b08_fixed_seed*/
+/runs/lofar/hybrid_b08_perimage_seed0/
+/runs/lofar/hybrid_b32_fixed_seed0/
+/runs/lofar/lr1e-4_perimage_seed0/
+/runs/lofar/matched_seed*/
+/runs/lofar/mesarcik_unet_paper_code*/
+/runs/lofar/recipe_*/
+/runs/lofar/hybrid_b08_nocw_seed*/eval_test_last_epoch/
+/runs/lofar/al/**/img*.json
+/runs/lofar/al/**/rand*.json
+/runs/lofar/al/**/rfi*.json
+/runs/lofar/al/**/unc*.json
+/runs/hybrid/hybrid_run_1024x265/
+/runs/hybrid/hybrid_run_paperdim/
+/runs/hybrid/hybrid_run_width_sweep/*
+!/runs/hybrid/hybrid_run_width_sweep/base08/
+/runs/unet/*
+!/runs/unet/unet_run_fixednorm/

@@ -1,0 +1,595 @@
+"""
+The HybridRFINet on the REAL LOFAR dataset.
+
+Same protocol as experiments/lofar_tfunet_baseline.py so the two numbers are
+directly comparable, and comparable to Mesarcik et al. Table 2:
+
+  train on   : the 6621 CLEAN training images (leaked + dead baselines removed)
+  test on    : the 109 expert-labelled images (data[3], human ground truth)
+  threshold  : selected on VALIDATION, applied to test -- never chosen on test
+  headline   : pooled pixel-wise F1 over all 109 images
+  guard      : every train/val image is fingerprinted against all 109 test
+               images before training starts; the run aborts if one matches
+
+ARCHITECTURE -- base 8, the project's own efficiency conclusion (PART 6)
+------------------------------------------------------------------------
+The width sweep on synthetic data:
+
+  base  4    152,582 params   F1 0.9547   -0.0265  <- genuinely breaks
+  base  8    593,842 params   F1 0.9749   -0.0063  <- DEFAULT here
+  base 16  2,342,474 params   F1 0.9788   -0.0024
+  base 32  9,304,186 params   F1 0.9812      --
+
+PART 6's conclusion is that roughly 8.7M of base 32's 9.3M parameters buy
+about half a percent of F1, and that the paper should be reframed around
+that. So base 8 is the default: 15.7x fewer parameters for -0.0063 F1, a gap
+inside the single-seed noise floor. base 4 is NOT viable -- the capacity floor
+sits between 152k and 594k parameters.
+
+Whether that efficiency finding *transfers to real data* is untested and is
+worth a table row on its own: run --base 8 and --base 32 and compare. Real
+LOFAR is a much harder task and may well have a different capacity floor.
+
+BUDGET -- matched to the hybrid's own synthetic run
+---------------------------------------------------
+The synthetic run was 700 images/epoch x 40 epochs at batch 1 = 28,000
+gradient steps. Defaults here reproduce exactly that: --iters_per_epoch 700,
+--total_epochs 40, --batch_size 1. LOFAR has 6621 training images, so these
+28,000 steps are drawn at random from all of them (~4.2 passes).
+
+OUTPUT SIZE -- note when comparing to tf_unet
+---------------------------------------------
+This model uses same padding and returns 512x512. tf_unet uses valid padding
+and returns 472x472. Both are reported: `pooled_f1` over the full 512x512, and
+`pooled_f1_crop472` over the matching centre crop, which is the number to line
+up against PART 12. RFI density differs by only 0.4% between the two regions
+(PART 12.7), so the two rarely disagree much.
+
+NORMALISATION
+-------------
+Default is `fixed`, because on full 512x512 LOFAR images fixed range beat
+per-image by 0.5021 vs 0.2456 for tf_unet (PART 12.11). BUT the hybrid has
+GroupNorm, which PART 1 argued is exactly why per-image normalisation does not
+hurt it the way it hurt tf_unet -- so `--norm per_image` is the interesting
+second arm here, not a formality.
+
+CLASS WEIGHTS
+-------------
+Unlike tf_unet (where weighting was lethal via the ReLU trap, PART 1), the
+hybrid is *designed* around weighted CE + Dice. Weights default to inverse
+frequency measured on the actual training split. On LOFAR that is roughly
+1:65, far more extreme than synthetic's ~1:6, so --class_weight_cap is
+provided and --no_class_weight disables it entirely.
+
+USAGE
+-----
+    ~/torch-env/bin/python experiments/lofar_hybrid.py
+
+    # the published width, for the efficiency comparison
+    ~/torch-env/bin/python experiments/lofar_hybrid.py --base 32 \
+        --output_dir runs/lofar/hybrid_b32_fixed_seed0
+
+RESUMING
+    Re-run the identical command; it reads progress.json and continues.
+"""
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+import time
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import auc, precision_recall_curve, roc_curve
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
+sys.path.insert(0, os.path.join(_ROOT, "src", "hybrid_rfi_package"))
+sys.path.insert(0, _ROOT)
+
+from hybrid_model import HybridRFINet          # noqa: E402
+from lofar_data import load_lofar, preprocess  # noqa: E402
+from hera_data import load_hera                # noqa: E402
+sys.path.insert(0, os.path.join(_HERE, "mesarcik_repro"))
+from train_mesarcik_unet import clip_bounds as mesarcik_clip_bounds   # noqa: E402
+from train_mesarcik_unet import transform as mesarcik_transform       # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+def assert_no_leakage(train_images, test_images, indices, label):
+    """All 109 test images are byte-identical to 109 training images (PART 11.5).
+    Relying on the index file being right is an assumption; this is a check."""
+    t0 = time.time()
+    fp = {}
+    for t in range(test_images.shape[0]):
+        fp.setdefault(float(test_images[t, :, :, 0].sum(dtype=np.float64)), []).append(t)
+    leaked = []
+    for i in np.asarray(indices):
+        i = int(i)
+        f = float(train_images[i, :, :, 0].sum(dtype=np.float64))
+        for t in fp.get(f, ()):
+            if np.array_equal(train_images[i], test_images[t]):
+                leaked.append((i, t))
+                break
+    if leaked:
+        raise SystemExit(
+            "\nABORTED -- TEST SET LEAKAGE in the {} split.\n{} image(s) are "
+            "byte-identical to test images, e.g. {}\n".format(label, len(leaked), leaked[:5]))
+    print("  leakage check     : {} clean, 0 of {} match a test image  ({:.1f}s)".format(
+        label, len(indices), time.time() - t0), flush=True)
+
+
+def normalise(img, mode, lo, hi):
+    if mode == "per_image":
+        return preprocess(img)                      # clip 20 sigma -> log -> min-max
+    if mode == "mesarcik":                          # their code: clip -> log -> min-max
+        return mesarcik_transform(img, lo, hi)
+    d = np.asarray(img, dtype=np.float64)
+    if mode == "fixed_log":
+        d = np.log(np.maximum(d, 1e-6))
+    return np.clip((d - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+
+def calibrate(images, indices, mode, n=200, seed=0):
+    rng = np.random.default_rng(seed)
+    sel = rng.choice(indices, size=min(n, len(indices)), replace=False)
+    los, his = [], []
+    for i in sel:
+        a = images[int(i), :, :, 0].astype(np.float64)
+        if mode == "fixed_log":
+            a = np.log(np.maximum(a, 1e-6))
+        los.append(np.percentile(a, 0.5))
+        his.append(np.percentile(a, 99.5))
+    return float(np.mean(los)), float(np.mean(his))
+
+
+def dice_loss(logits, target, eps=1.0):
+    probs = F.softmax(logits, dim=1)[:, 1]
+    t = (target == 1).float()
+    inter = (probs * t).sum(dim=(1, 2))
+    denom = probs.sum(dim=(1, 2)) + t.sum(dim=(1, 2))
+    return (1.0 - (2.0 * inter + eps) / (denom + eps)).mean()
+
+
+def dice_loss_pooled(logits, target, eps=1.0):
+    """Dice over the whole batch at once. With --patch, a batch of 256 tiles of 32x32
+    holds the same 262,144 pixels as one 512x512 image, so this is the same Dice
+    as dice_loss at batch 1, just computed over tiles instead of one whole image."""
+    probs = F.softmax(logits, dim=1)[:, 1]
+    t = (target == 1).float()
+    return 1.0 - (2.0 * (probs * t).sum() + eps) / (probs.sum() + t.sum() + eps)
+
+
+def tile_batches(images, masks, indices, P, n_imgs, mode, lo, hi, rng, n_steps):
+    """--patch: each step takes n_imgs random training images and 512*512/P^2/n_imgs
+    random non-overlapping PxP tiles from each (the authors' tile grid), so a step has
+    the same number of pixels as one whole image."""
+    T = 512 // P
+    per = (T * T) // n_imgs
+    for _ in range(n_steps):
+        X, Y = [], []
+        for i in rng.choice(indices, size=n_imgs, replace=False):
+            x = normalise(images[int(i), :, :, 0], mode, lo, hi).reshape(T, P, T, P).transpose(0, 2, 1, 3)
+            y = np.asarray(masks[int(i), :, :, 0]).reshape(T, P, T, P).transpose(0, 2, 1, 3)
+            k = rng.choice(T * T, size=per, replace=False)
+            X.append(x.reshape(T * T, P, P)[k]); Y.append(y.reshape(T * T, P, P)[k])
+        X = np.concatenate(X); Y = np.concatenate(Y).astype(np.int64)
+        yield (torch.from_numpy(X).unsqueeze(1).float(), torch.from_numpy(Y))
+
+
+# ---------------------------------------------------------------------------
+# Edge-aware training (PART 22.4). AOFlagger's masks disagree with the human
+# expert mostly at object EDGES (PART 22.3), so the 1-pixel rim of every
+# training mask is treated as uncertain instead of copied verbatim.
+#   svls   : spatially varying label smoothing -- soft targets from a small
+#            Gaussian blur of the mask (Islam & Glocker 2021). Interiors stay
+#            ~1, far background 0, rims in between. Nothing is ignored.
+#   ignore : the loss skips the rim on both sides of each edge, EXCEPT the
+#            pixels of objects too thin to have an interior (otherwise thin
+#            narrowband lines would lose all supervision).
+# Both are symmetric rules fixed in advance; neither looks at expert labels.
+# ---------------------------------------------------------------------------
+def _dilate(m):
+    return F.max_pool2d(m, 3, stride=1, padding=1)
+
+
+def _erode(m):
+    return 1.0 - F.max_pool2d(1.0 - m, 3, stride=1, padding=1)
+
+
+def gaussian_kernel3(sigma):
+    ax = torch.tensor([-1.0, 0.0, 1.0])
+    g = torch.exp(-(ax[:, None] ** 2 + ax[None, :] ** 2) / (2 * sigma ** 2))
+    return (g / g.sum()).view(1, 1, 3, 3)
+
+
+def edge_targets(y, mode, sigma=0.7):
+    """y: (B,H,W) int labels. Returns (soft target in [0,1], per-pixel weight)."""
+    m = (y == 1).float().unsqueeze(1)                       # (B,1,H,W)
+    if mode == "svls":
+        k = gaussian_kernel3(sigma).to(m.device)
+        t = F.conv2d(F.pad(m, (1, 1, 1, 1), mode="replicate"), k)
+        return t.squeeze(1), torch.ones_like(t.squeeze(1))
+    if mode == "ignore":
+        core = _erode(m)                                    # interior (depth >= 2)
+        band = _dilate(m) * (1.0 - core)                    # rim, both sides of the edge
+        thin = m * (1.0 - _dilate(core))                    # RFI px with no interior nearby
+        w = 1.0 - band * (1.0 - thin)                       # 0 on the rim, but keep thin objects
+        return m.squeeze(1), w.squeeze(1)
+    raise ValueError(mode)
+
+
+def soft_ce(logits, t, w, cw):
+    """Cross-entropy against soft targets t, pixel weights w, class weights cw."""
+    logp = F.log_softmax(logits, dim=1)
+    per_px = -(cw[1] * t * logp[:, 1] + cw[0] * (1.0 - t) * logp[:, 0])
+    return (w * per_px).sum() / w.sum().clamp_min(1.0)
+
+
+def soft_dice(logits, t, w, eps=1.0):
+    probs = F.softmax(logits, dim=1)[:, 1]
+    inter = (w * probs * t).sum(dim=(1, 2))
+    denom = (w * probs).sum(dim=(1, 2)) + (w * t).sum(dim=(1, 2))
+    return (1.0 - (2.0 * inter + eps) / (denom + eps)).mean()
+
+
+# ---------------------------------------------------------------------------
+def batches(images, masks, indices, bs, mode, lo, hi, rng, n_steps):
+    """Yield n_steps random batches, reading only what is needed from the memmap."""
+    for _ in range(n_steps):
+        sel = rng.choice(indices, size=bs, replace=False)
+        X = np.stack([normalise(images[int(i), :, :, 0], mode, lo, hi) for i in sel])
+        Y = np.stack([masks[int(i), :, :, 0] for i in sel]).astype(np.int64)
+        yield (torch.from_numpy(X).unsqueeze(1).float(), torch.from_numpy(Y))
+
+
+@torch.no_grad()
+def predict_scores(model, images, masks, indices, mode, lo, hi, device, bs=2, patch=0):
+    """patch > 0: predict each image as non-overlapping patch x patch tiles and put
+    them back together (as the authors' reconstruct() does)."""
+    model.eval()
+    yt, yp = [], []
+    idx = np.asarray(indices)
+    for s in range(0, len(idx), bs):
+        sel = idx[s:s + bs]
+        X = np.stack([normalise(images[int(i), :, :, 0], mode, lo, hi) for i in sel])
+        if patch:
+            T = 512 // patch
+            n = len(sel)
+            t = X.reshape(n, T, patch, T, patch).transpose(0, 1, 3, 2, 4).reshape(-1, 1, patch, patch)
+            pt = F.softmax(model(torch.from_numpy(np.ascontiguousarray(t)).float().to(device)),
+                           dim=1)[:, 1].cpu().numpy()
+            p = pt.reshape(n, T, T, patch, patch).transpose(0, 1, 3, 2, 4).reshape(n, 512, 512)
+        else:
+            x = torch.from_numpy(X).unsqueeze(1).float().to(device)
+            p = F.softmax(model(x), dim=1)[:, 1].cpu().numpy()
+        yp.append(p.reshape(len(sel), -1))
+        yt.append(np.stack([masks[int(i), :, :, 0] for i in sel]).reshape(len(sel), -1))
+    model.train()
+    return np.concatenate(yt), np.concatenate(yp)      # (N, 512*512) each
+
+
+def metrics_from(yt2d, yp2d, threshold, crop=None):
+    """crop: if given, restrict to a centre crop of that size before scoring."""
+    if crop:
+        n = yt2d.shape[0]
+        a = yt2d.reshape(n, 512, 512); b = yp2d.reshape(n, 512, 512)
+        c = (512 - crop) // 2
+        yt = a[:, c:512 - c, c:512 - c].ravel().astype(bool)
+        yp = b[:, c:512 - c, c:512 - c].ravel()
+    else:
+        yt = yt2d.ravel().astype(bool); yp = yp2d.ravel()
+    p = yp > threshold
+    tp = int((p & yt).sum()); fp = int((p & ~yt).sum())
+    fn = int((~p & yt).sum()); tn = int((~p & ~yt).sum())
+    pr = tp / max(tp + fp, 1); rc = tp / max(tp + fn, 1)
+    f1 = 2 * pr * rc / max(pr + rc, 1e-12)
+    fpr, tpr, _ = roc_curve(yt, yp)
+    pc, rcv, _ = precision_recall_curve(yt, yp)
+    f1c = 2 * pc * rcv / (pc + rcv + 1e-10)
+    return dict(pooled_f1=float(f1), pooled_precision=float(pr), pooled_recall=float(rc),
+                TP=tp, FP=fp, FN=fn, TN=tn, max_f1=float(np.max(f1c)),
+                roc_auc=float(auc(fpr, tpr)), pr_auc=float(auc(rcv, pc)),
+                threshold=float(threshold), positive_fraction=float(yt.mean()))
+
+
+CURVE_COLS = ["epoch", "train_loss", "train_ce", "train_dice_loss",
+              "val_ce", "val_dice_loss", "val_max_f1", "val_roc_auc"]
+
+
+def val_losses(yt2d, yp2d, eps=1.0):
+    """Validation cross-entropy (mean over pixels) and soft Dice loss (mean over images,
+    the same formula as dice_loss with batch 1), from the predicted RFI probabilities."""
+    ce_sum, n_px, dice = 0.0, 0, []
+    for t, p in zip(yt2d, yp2d):
+        t = t.astype(np.float64); p = np.clip(p.astype(np.float64), 1e-7, 1 - 1e-7)
+        ce_sum += float(-(t * np.log(p) + (1 - t) * np.log(1 - p)).sum()); n_px += t.size
+        dice.append(1.0 - (2.0 * (p * t).sum() + eps) / (p.sum() + t.sum() + eps))
+    return ce_sum / n_px, float(np.mean(dice))
+
+
+def write_curves(path, rows):
+    new = not os.path.exists(path)
+    with open(path, "a") as f:
+        if new:
+            f.write(",".join(CURVE_COLS) + "\n")
+        for r in rows:
+            f.write(",".join("" if r.get(c) is None else repr(r[c]) for c in CURVE_COLS) + "\n")
+
+
+def best_threshold(yt2d, yp2d):
+    yt = yt2d.ravel().astype(bool); yp = yp2d.ravel()
+    pc, rc, th = precision_recall_curve(yt, yp)
+    f1 = 2 * pc * rc / (pc + rc + 1e-10)
+    k = int(np.argmax(f1[:-1])) if len(th) else 0
+    return (float(th[k]) if len(th) else 0.5), float(f1[k])
+
+
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dataset", choices=["lofar", "hera"], default="lofar",
+                    help="hera: train on AOFlagger labels, test on the simulator's (PART 38)")
+    ap.add_argument("--base", type=int, default=8,
+                    help="8 = PART 6's efficiency pick (593,842 params) and the default. "
+                         "32 = the published width (9,304,186). 4 genuinely breaks -- "
+                         "PART 6 measured -0.0265 F1 there.")
+    ap.add_argument("--depth", type=int, default=4)
+    ap.add_argument("--dropout", type=float, default=0.2)
+    ap.add_argument("--norm", choices=["fixed", "fixed_log", "per_image", "mesarcik"], default="fixed",
+                    help="mesarcik = the authors' scaling (their code): clip to [|mu-3sd|, mu+95sd] "
+                         "of the clean pixels of the training images, natural log, min-max")
+    ap.add_argument("--learning_rate", type=float, default=1e-3)
+    ap.add_argument("--batch_size", type=int, default=1,
+                    help="1 matches the synthetic run. Measured on the 6 GB card: "
+                         "base 8 fits batch 8 (2.9 GB); base 32 fits batch 2 (3.0 GB).")
+    ap.add_argument("--total_epochs", type=int, default=40)
+    ap.add_argument("--iters_per_epoch", type=int, default=700,
+                    help="700x40 = 28,000 steps, identical to the synthetic run")
+    ap.add_argument("--epochs_per_chunk", type=int, default=2)
+    ap.add_argument("--n_val_images", type=int, default=150)
+    ap.add_argument("--dice_weight", type=float, default=1.0)
+    ap.add_argument("--class_weight_cap", type=float, default=0.0,
+                    help="cap the RFI-class weight (0 = uncapped inverse frequency)")
+    ap.add_argument("--no_class_weight", action="store_true")
+    ap.add_argument("--val_frac", type=float, default=0.1)
+    ap.add_argument("--limit_train", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--output_dir", default=None)
+    ap.add_argument("--variant", default="hybrid",
+                    help="'hybrid' (default) is the published HybridRFINet. Any "
+                         "other name builds the component-switchable model from "
+                         "models_ablation.py -- hybrid_full, no_strip, no_eca, "
+                         "no_res, plain_unet, no_groupnorm. Everything else "
+                         "(data, splits, loss, eval, thresholding) is unchanged, "
+                         "so the comparison is controlled. See PART 17.")
+    ap.add_argument("--edge_mode", choices=["none", "svls", "ignore"], default="none",
+                    help="edge-aware training (PART 22.4): treat the 1-px rim of each "
+                         "AOFlagger mask as uncertain. 'none' = original training.")
+    ap.add_argument("--edge_sigma", type=float, default=0.7,
+                    help="Gaussian sigma (pixels) of the 3x3 blur used by --edge_mode svls")
+    ap.add_argument("--patch", type=int, default=0,
+                    help="0 = whole 512x512 images (default). 32 = train on random 32x32 tiles "
+                         "(256 per step, the pixels of one image, from --patch_images images) "
+                         "and predict tile by tile, as Mesarcik et al. do. Dice is then "
+                         "computed over the whole batch.")
+    ap.add_argument("--patch_images", type=int, default=8,
+                    help="with --patch: number of images the tiles of one step come from")
+    ap.add_argument("--lr_schedule", choices=["cosine", "constant"], default="cosine",
+                    help="cosine (default) or constant learning rate, as Mesarcik et al.")
+    ap.add_argument("--log_curves", action="store_true",
+                    help="write <output_dir>/curves.csv: per-epoch training loss and its CE and "
+                         "Dice parts, and at every validation the validation CE, soft Dice loss, "
+                         "max F1 and ROC AUC. Logging only; training is unchanged.")
+    a = ap.parse_args()
+
+    out = a.output_dir or os.path.join(_ROOT, "runs", a.dataset,
+                                       "hybrid_base{}_{}_seed{}".format(a.base, a.norm, a.seed))
+    os.makedirs(out, exist_ok=True)
+    torch.manual_seed(a.seed)
+    np.random.seed(a.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    d = load_hera() if a.dataset == "hera" else load_lofar()
+    n_test = d.test_images.shape[0]
+    rng = np.random.default_rng(a.seed)
+    idx = d.clean_train_idx.copy()
+    rng.shuffle(idx)
+    if a.limit_train:
+        idx = idx[:a.limit_train]
+    n_val = max(1, int(len(idx) * a.val_frac))
+    val_idx, tr_idx = idx[:n_val], idx[n_val:]
+
+    if a.variant == "hybrid":
+        model = HybridRFINet(1, 2, base=a.base, depth=a.depth, dropout=a.dropout).to(device)
+        model_name = "HybridRFINet"
+    else:
+        from models_ablation import build          # noqa: PLC0415
+        model = build(a.variant, base=a.base, depth=a.depth, dropout=a.dropout).to(device)
+        model_name = "ConfigurableUNet[{}]".format(a.variant)
+    n_par = sum(p.numel() for p in model.parameters())
+
+    print("=" * 74)
+    print("  {} on {}  |  base {}  |  norm = {}".format(
+        model_name, "simulated HERA" if a.dataset == "hera" else "REAL LOFAR", a.base, a.norm))
+    print("=" * 74)
+    print("  parameters        : {:,}".format(n_par))
+    print("  device            : {}".format(device))
+    print("  train / val / test: {} / {} / {}".format(len(tr_idx), len(val_idx), n_test))
+    print("  steps/epoch       : {} x {} epochs = {:,} gradient steps".format(
+        a.iters_per_epoch, a.total_epochs, a.iters_per_epoch * a.total_epochs))
+    print("                      (synthetic run was 700 x 40 = 28,000)")
+
+    assert_no_leakage(d.train_images, d.test_images, tr_idx, "train")
+    assert_no_leakage(d.train_images, d.test_images, val_idx, "val")
+
+    lo = hi = None
+    if a.norm in ("fixed", "fixed_log"):
+        lo, hi = calibrate(d.train_images, tr_idx, a.norm, seed=a.seed)
+        print("  fixed range       : [{:.6g}, {:.6g}]".format(lo, hi))
+    elif a.norm == "mesarcik":
+        t0 = time.time()
+        lo, hi, _, _ = mesarcik_clip_bounds(d.train_images, d.train_masks, tr_idx, (3, 95))
+        print("  their clip bounds : [{:.6g}, {:.6g}]  ({:.0f}s)".format(lo, hi, time.time() - t0))
+    if a.patch:
+        assert 512 % a.patch == 0 and ((512 // a.patch) ** 2) % a.patch_images == 0
+        print("  training input    : {}x{} tiles, {} per step from {} images; prediction tile by tile".format(
+            a.patch, a.patch, (512 // a.patch) ** 2, a.patch_images))
+    print("  lr schedule       : {}".format(a.lr_schedule))
+
+    # class weights from the ACTUAL training split
+    samp = rng.choice(tr_idx, size=min(400, len(tr_idx)), replace=False)
+    mean_rfi = float(np.mean([d.train_masks[int(i), :, :, 0].mean() for i in samp]))
+    if a.no_class_weight:
+        cw = [1.0, 1.0]
+    else:
+        cw = [0.5 / (1 - mean_rfi), 0.5 / mean_rfi]
+        if a.class_weight_cap > 0:
+            cw[1] = min(cw[1], a.class_weight_cap)
+    print("  measured RFI frac : {:.4f}%  -> class_weights [{:.3f}, {:.3f}]".format(
+        mean_rfi * 100, cw[0], cw[1]))
+    print("  edge-aware mode   : {}{}".format(
+        a.edge_mode, " (sigma {})".format(a.edge_sigma) if a.edge_mode == "svls" else ""))
+    print("=" * 74, flush=True)
+
+    ce = torch.nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32).to(device))
+    opt = torch.optim.Adam(model.parameters(), lr=a.learning_rate)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.total_epochs)
+
+    prog_path = os.path.join(out, "progress.json")
+    prog = json.load(open(prog_path)) if os.path.exists(prog_path) else \
+        {"epochs_completed": 0, "best_f1": -1.0, "best_epoch": None}
+    ckpt, best = os.path.join(out, "last.pt"), os.path.join(out, "best.pt")
+    if os.path.exists(ckpt):
+        st = torch.load(ckpt, map_location=device)
+        model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"])
+        sched.load_state_dict(st["sched"])
+        print("  resumed from epoch {}".format(prog["epochs_completed"]), flush=True)
+
+    val_eval = val_idx[:a.n_val_images]
+    curve_rows = []
+    t_start = time.time()
+    while prog["epochs_completed"] < a.total_epochs:
+        n_ep = min(a.epochs_per_chunk, a.total_epochs - prog["epochs_completed"])
+        model.train()
+        for _ in range(n_ep):
+            tot, nb = 0.0, 0
+            tot_ce, tot_dice = 0.0, 0.0
+            if a.patch:
+                assert a.batch_size == 1, "--patch replaces --batch_size"
+                it = tile_batches(d.train_images, d.train_masks, tr_idx, a.patch, a.patch_images,
+                                  a.norm, lo, hi, rng, a.iters_per_epoch)
+            else:
+                it = batches(d.train_images, d.train_masks, tr_idx, a.batch_size,
+                             a.norm, lo, hi, rng, a.iters_per_epoch)
+            for x, y in it:
+                x, y = x.to(device), y.to(device)
+                opt.zero_grad()
+                logits = model(x)
+                if a.edge_mode == "none":
+                    l_ce = ce(logits, y)
+                    l_dice = dice_loss_pooled(logits, y) if a.patch else dice_loss(logits, y)
+                    loss = l_ce + a.dice_weight * l_dice
+                else:
+                    t, w = edge_targets(y, a.edge_mode, a.edge_sigma)
+                    l_ce = soft_ce(logits, t, w, cw)
+                    l_dice = soft_dice(logits, t, w)
+                    loss = l_ce + a.dice_weight * l_dice
+                loss.backward()
+                opt.step()
+                tot += float(loss.item()); nb += 1
+                if a.log_curves:
+                    tot_ce += float(l_ce.item()); tot_dice += float(l_dice.item())
+            if a.lr_schedule == "cosine":
+                sched.step()
+            prog["epochs_completed"] += 1
+            if a.log_curves:
+                curve_rows.append(dict(epoch=prog["epochs_completed"],
+                                       train_loss=tot / max(nb, 1),
+                                       train_ce=tot_ce / max(nb, 1),
+                                       train_dice_loss=tot_dice / max(nb, 1)))
+            el = (time.time() - t_start) / 60
+            eta = el / max(prog["epochs_completed"], 1) * (a.total_epochs - prog["epochs_completed"])
+            print("  epoch {}/{}  loss {:.4f}  |  {:.1f}m elapsed  ETA {:.1f}m".format(
+                prog["epochs_completed"], a.total_epochs, tot / max(nb, 1), el, eta), flush=True)
+
+        yt, yp = predict_scores(model, d.train_images, d.train_masks, val_eval,
+                                a.norm, lo, hi, device, patch=a.patch)
+        vm = metrics_from(yt, yp, 0.5)
+        print("     -> val max-F1 {:.4f}  ROC {:.4f}".format(vm["max_f1"], vm["roc_auc"]), flush=True)
+        if a.log_curves:
+            v_ce, v_dice = val_losses(yt, yp)
+            curve_rows[-1].update(val_ce=v_ce, val_dice_loss=v_dice,
+                                  val_max_f1=vm["max_f1"], val_roc_auc=vm["roc_auc"])
+            write_curves(os.path.join(out, "curves.csv"), curve_rows)
+            curve_rows = []
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "sched": sched.state_dict()}, ckpt)
+        if vm["max_f1"] > prog["best_f1"]:
+            prog["best_f1"], prog["best_epoch"] = vm["max_f1"], prog["epochs_completed"]
+            torch.save(model.state_dict(), best)
+            print("        new best checkpoint", flush=True)
+        json.dump(prog, open(prog_path, "w"), indent=2)
+
+    # ---- final evaluation on the 109 human-labelled images -------------------
+    print("\nBest val max-F1 {:.4f} @ epoch {}".format(prog["best_f1"], prog["best_epoch"]))
+    model.load_state_dict(torch.load(best, map_location=device))
+
+    yt_v, yp_v = predict_scores(model, d.train_images, d.train_masks, val_eval,
+                                a.norm, lo, hi, device, patch=a.patch)
+    th, vf1 = best_threshold(yt_v, yp_v)
+    print("Threshold selected on validation: {:.4f} (val F1 {:.4f})".format(th, vf1))
+
+    yt_t, yp_t = predict_scores(model, d.test_images, d.test_masks, np.arange(n_test),
+                                a.norm, lo, hi, device, patch=a.patch)
+    m = metrics_from(yt_t, yp_t, th)
+    m_crop = metrics_from(yt_t, yp_t, th, crop=472)
+    m["pooled_f1_crop472"] = m_crop["pooled_f1"]
+    m["max_f1_crop472"] = m_crop["max_f1"]
+    m["roc_auc_crop472"] = m_crop["roc_auc"]
+    m.update(edge_mode=a.edge_mode,
+             edge_sigma=a.edge_sigma if a.edge_mode == "svls" else None)
+    m.update(model=model_name, variant=a.variant,
+             base=a.base, depth=a.depth, dropout=a.dropout,
+             parameters=n_par, norm=a.norm, fixed_range=[lo, hi], class_weights=cw,
+             dice_weight=a.dice_weight, learning_rate=a.learning_rate,
+             patch=a.patch, patch_images=a.patch_images if a.patch else None,
+             lr_schedule=a.lr_schedule,
+             batch_size=a.batch_size, epochs=prog["epochs_completed"],
+             gradient_steps=a.iters_per_epoch * prog["epochs_completed"],
+             seed=a.seed, n_train=len(tr_idx), n_val=len(val_idx),
+             val_selected_threshold=th, best_val_max_f1=prog["best_f1"],
+             best_epoch=prog["best_epoch"],
+             dataset=a.dataset,
+             test_set="135 HERA images, simulator labels" if a.dataset == "hera"
+                      else "109 expert-labelled LOFAR baselines (data[3])")
+
+    print("\n" + "=" * 74)
+    print("  RESULT — {} on {}".format(model_name, "simulated HERA, simulator labels"
+                                       if a.dataset == "hera" else "real LOFAR, human ground truth"))
+    print("=" * 74)
+    print("  pooled F1 (512x512)      : {:.4f}   precision {:.4f}  recall {:.4f}".format(
+        m["pooled_f1"], m["pooled_precision"], m["pooled_recall"]))
+    print("  pooled F1 (472 crop)     : {:.4f}   <-- compare with tf_unet, PART 12".format(
+        m["pooled_f1_crop472"]))
+    print("  max F1 (oracle, 512)     : {:.4f}   <-- compare with the paper's Table 2".format(
+        m["max_f1"]))
+    print("  ROC AUC                  : {:.4f}".format(m["roc_auc"]))
+    print("  PR  AUC                  : {:.4f}".format(m["pr_auc"]))
+    print("-" * 74)
+    print("  benchmarks: sigma-clip 0.4103 | tf_unet lr1e-4 0.5482 | AOFlagger 0.5698")
+    print("              paper's U-Net 0.5876 | RFI-Net 0.5979   (all max-F1)")
+    print("=" * 74)
+
+    os.makedirs(os.path.join(out, "eval_test"), exist_ok=True)
+    dest = os.path.join(out, "eval_test", "metrics.json")
+    json.dump(m, open(dest, "w"), indent=2)
+    print("\nSaved: {}".format(dest))
+
+
+if __name__ == "__main__":
+    main()

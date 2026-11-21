@@ -1,0 +1,66 @@
+cff-version: 1.2.0
+title: >-
+  Kestrel: flagging radio frequency interference in radio spectrograms
+message: >-
+  If you use this software, please cite it as below, and cite the original
+  U-Net RFI method of Akeret et al. (2017) that the baseline reproduces.
+type: software
+authors:
+  - family-names: Singh Raina
+    given-names: Ronak
+repository-code: "https://github.com/RonakSinghRaina/MINOR-Project"
+license: GPL-3.0-or-later
+abstract: >-
+  Pixel-wise flagging of radio frequency interference (RFI) in radio
+  spectrograms with Kestrel, a U-Net-based network, compared with tf_unet
+  (Akeret et al. 2017) and the methods published by Mesarcik et al. (2022) on
+  real LOFAR data with expert test labels and on simulated HERA data.
+keywords:
+  - radio frequency interference
+  - RFI mitigation
+  - radio astronomy
+  - semantic segmentation
+  - U-Net
+  - deep learning
+references:
+  - type: article
+    title: >-
+  Kestrel: flagging radio frequency interference in radio spectrograms
+      networks
+    authors:
+      - family-names: Akeret
+        given-names: Joel
+      - family-names: Chang
+        given-names: Chihway
+      - family-names: Lucchi
+        given-names: Aurelien
+      - family-names: Refregier
+        given-names: Alexandre
+    journal: Astronomy and Computing
+    volume: 18
+    start: 35
+    end: 39
+    year: 2017
+    doi: 10.1016/j.ascom.2017.01.002
+  - type: article
+    title: >-
+  Kestrel: flagging radio frequency interference in radio spectrograms
+    authors:
+      - family-names: Offringa
+        given-names: A. R.
+      - family-names: de Bruyn
+        given-names: A. G.
+      - family-names: Biehl
+        given-names: M.
+      - family-names: Zaroubi
+        given-names: S.
+      - family-names: Bernardi
+        given-names: G.
+      - family-names: Pandey
+        given-names: V. N.
+    journal: Monthly Notices of the Royal Astronomical Society
+    volume: 405
+    start: 155
+    end: 167
+    year: 2010
+    doi: 10.1111/j.1365-2966.2010.16471.x
